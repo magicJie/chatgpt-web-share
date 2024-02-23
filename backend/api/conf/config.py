@@ -23,6 +23,7 @@ default_openai_web_model_code_mapping = {
 
 class CommonSetting(BaseModel):
     print_sql: bool = False
+    print_traceback: bool = True
     create_initial_admin_user: bool = True
     initial_admin_user_username: str = 'admin'
     initial_admin_user_password: str = 'password'
@@ -72,6 +73,9 @@ class OpenaiWebChatGPTSetting(BaseModel):
     team_account_id: Optional[str] = None
     chatgpt_base_url: Optional[str] = None
     proxy: Optional[str] = None
+    wss_proxy: Optional[str] = None
+    enable_arkose_endpoint: bool = False
+    arkose_endpoint_base: Optional[str] = None
     common_timeout: int = Field(20, ge=1,
                                 description="Increase this value if timeout error occurs.")  # connect, read, write
     ask_timeout: int = Field(600, ge=1)
@@ -87,6 +91,13 @@ class OpenaiWebChatGPTSetting(BaseModel):
     @field_validator("chatgpt_base_url")
     @classmethod
     def chatgpt_base_url_end_with_slash(cls, v):
+        if v is not None and not v.endswith('/'):
+            v += '/'
+        return v
+
+    @field_validator("arkose_endpoint_base")
+    @classmethod
+    def arkose_endpoint_base_end_with_slash(cls, v):
         if v is not None and not v.endswith('/'):
             v += '/'
         return v

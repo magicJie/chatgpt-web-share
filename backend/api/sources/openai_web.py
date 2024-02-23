@@ -180,53 +180,57 @@ def make_session() -> httpx.AsyncClient:
             "http://": config.openai_web.proxy,
             "https://": config.openai_web.proxy,
         }
-        session = httpx.AsyncClient(proxies=proxies)
+        session = httpx.AsyncClient(proxies=proxies, timeout=config.openai_web.common_timeout)
     else:
-        session = httpx.AsyncClient()
+        session = httpx.AsyncClient(timeout=config.openai_web.common_timeout)
     session.headers.clear()
     session.headers.update(default_header())
     return session
 
 
-async def _receive_from_websocket(wss_url, timeout):
+async def _receive_from_websocket(wss_url):
+    timeout = Config().openai_web.common_timeout
+    wss_proxy = Config().openai_web.wss_proxy
     recv_msg_count = 0
-    async with websockets.connect(wss_url, subprotocols=["json.reliable.webpubsub.azure.v1"], open_timeout=timeout) as websocket:
-        logger.debug(f"Connected to Websocket {wss_url[:65]}...{wss_url[-10:]}")
-        while True:
-            try:
-                message = await asyncio.wait_for(websocket.recv(), timeout)
-                message = json.loads(message)
-                if "data" not in message:
-                    continue
-                sequence_id = message["sequenceId"]
-                data = base64.b64decode(message['data']['body']).decode('utf-8')
-                if not data or data is None:
-                    continue
-                if "data: " in data:
-                    data = data[6:]
-                if "[DONE]" in data:
-                    # send ack to server
-                    await websocket.send(json.dumps({"type": "sequenceAck", "sequenceId": sequence_id}))
-                    break
-                try:
-                    data = json.loads(data)
-                except json.decoder.JSONDecodeError:
-                    continue
-                if not _check_fields(data):
-                    if "error" in data:
-                        raise OpenaiWebException(data["error"])
-                    else:
-                        logger.warning(f"Field missing. Details: {str(data)}")
+    timeout_settings = aiohttp.ClientTimeout(total=None, connect=timeout, sock_read=timeout)
+
+    async with aiohttp.ClientSession(timeout=timeout_settings) as session:
+        async with session.ws_connect(wss_url, protocols=["json.reliable.webpubsub.azure.v1"], proxy=wss_proxy) as ws:
+            logger.debug(f"Connected to Websocket {wss_url[:65]}...{wss_url[-10:]}")
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    message = json.loads(msg.data)
+                    if "data" not in message:
                         continue
-                recv_msg_count += 1
-                # batch ack to server every 10 messages
-                if recv_msg_count > 10:
-                    await websocket.send(json.dumps({"type": "sequenceAck", "sequenceId": sequence_id}))
-                    recv_msg_count = 0
-                yield data
-            except asyncio.TimeoutError:
-                logger.error("Timeout when receiving messages from wss")
-                break
+                    sequence_id = message["sequenceId"]
+                    data = base64.b64decode(message['data']['body']).decode('utf-8')
+                    if not data or data is None:
+                        continue
+                    if "data: " in data:
+                        data = data[6:]
+                    if "[DONE]" in data:
+                        # send ack to server
+                        await ws.send_json({"type": "sequenceAck", "sequenceId": sequence_id})
+                        break
+                    try:
+                        data = json.loads(data)
+                    except json.decoder.JSONDecodeError:
+                        continue
+                    if not _check_fields(data):
+                        if "error" in data:
+                            raise OpenaiWebException(data["error"])
+                        else:
+                            logger.warning(f"Field missing. Details: {str(data)}")
+                            continue
+                    recv_msg_count += 1
+                    # batch ack to server every 10 messages
+                    if recv_msg_count > 10:
+                        await ws.send_json({"type": "sequenceAck", "sequenceId": sequence_id})
+                        recv_msg_count = 0
+                    yield data
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error("WebSocket connection closed with exception %s" % ws.exception())
+                    break
     logger.debug("Connection closed.")
 
 
@@ -316,6 +320,7 @@ class OpenaiWebChatManager(metaclass=SingletonMeta):
                        plugin_ids: list[str] = None,
                        attachments: list[OpenaiWebChatMessageMetadataAttachment] = None,
                        multimodal_image_parts: list[OpenaiWebChatMessageMultimodalTextContentImagePart] = None,
+                       arkose_token: str = None,
                        **_kwargs):
 
         assert config.openai_web.enabled, "OpenAI Web is not enabled"
@@ -363,23 +368,27 @@ class OpenaiWebChatManager(metaclass=SingletonMeta):
 
         completion_request = OpenaiWebCompleteRequest(
             action=action,
-            arkose_token=None,
+            arkose_token=arkose_token,
             conversation_mode=OpenaiWebCompleteRequestConversationMode(kind="primary_assistant"),
             conversation_id=str(conversation_id) if conversation_id else None,
             messages=messages,
             parent_message_id=str(parent_message_id) if parent_message_id else None,
             model=model.code(),
             plugin_ids=plugin_ids
-        ).dict(exclude_none=True)
-        completion_request["arkose_token"] = None
+        )
+        completion_request_dict = completion_request.dict(exclude_none=True)
+        if "arkose_token" not in completion_request_dict:
+            completion_request_dict["arkose_token"] = None
         data_json = json.dumps(jsonable_encoder(completion_request))
+
+        headers = req_headers(use_team) | {
+            "referer": "https://chat.openai.com/" + (f"c/{conversation_id}" if conversation_id else "")}
+        if arkose_token is not None:
+            headers["Openai-Sentinel-Arkose-Token"] = arkose_token
 
         async with self.session.stream(method="POST", url=f"{config.openai_web.chatgpt_base_url}conversation",
                                        data=data_json, timeout=timeout,
-                                       headers=req_headers(use_team) | {
-                                           "referer": "https://chat.openai.com/" + (
-                                                   f"c/{conversation_id}" if conversation_id else "")
-                                       }) as response:
+                                       headers=headers) as response:
             await _check_response(response)
 
             async for line in response.aiter_lines():
@@ -389,11 +398,10 @@ class OpenaiWebChatManager(metaclass=SingletonMeta):
                 # wss
                 try:
                     line = json.loads(line)
-                    # TODO: define model
                     wss_url = line.get("wss_url")
                     # connect to wss_url and receive messages
                     if wss_url:
-                        async for l in _receive_from_websocket(wss_url, Config().openai_web.common_timeout):
+                        async for l in _receive_from_websocket(wss_url):
                             yield l
                         break
                 except json.decoder.JSONDecodeError:
@@ -404,13 +412,21 @@ class OpenaiWebChatManager(metaclass=SingletonMeta):
                     line = line[6:]
                 if "[DONE]" in line:
                     break
-                if not _check_fields(line):
-                    if "error" in line:
-                        raise OpenaiWebException(line["error"])
+                try:
+                    if not isinstance(line, dict):
+                        data = json.loads(line)
                     else:
-                        logger.warning(f"Field missing. Details: {str(line)}")
-                        continue
-                yield line
+                        data = line
+                    if not _check_fields(data):
+                        if "error" in data:
+                            logger.warning(f"error in message stream: {line}")
+                            raise OpenaiWebException(data["error"])
+                        else:
+                            logger.warning(f"Field missing. Details: {line}")
+                            continue
+                    yield data
+                except json.decoder.JSONDecodeError:
+                    continue
 
     async def delete_conversation(self, conversation_id: str, source_id: str = None):
         # await self.chatbot.delete_conversation(conversation_id)
